@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{Local, Utc};
 use clap::Parser;
 use crossterm::{
     cursor,
@@ -59,7 +59,7 @@ struct WatState {
     last_git_activity: Option<(String, Instant)>,
     workdir: PathBuf,
     ignored_dirs: HashMap<String, Instant>,  // Track activity in ignored directories
-    last_commit: Option<(String, String, Vec<String>, Instant)>,  // (hash, message, files, time)
+    last_commit: Option<(String, String, Vec<String>, i64)>,  // (hash, message, files, commit_timestamp)
     render_count: usize,  // For spinner animation
 }
 
@@ -92,7 +92,8 @@ impl WatState {
                         .unwrap_or("")
                         .to_string();
                     let files = Self::get_commit_files(r, &commit);
-                    (short_hash, message, files, Instant::now() - Duration::from_secs(3600)) // Mark as old
+                    let commit_time = commit.time().seconds();
+                    (short_hash, message, files, commit_time)
                 })
             })
         });
@@ -142,10 +143,10 @@ impl WatState {
                 {
                     self.last_git_activity = Some(("branch change".to_string(), now));
                     // Check for new commit
-                    self.update_last_commit(now);
+                    self.update_last_commit();
                 } else if path.to_string_lossy().contains("/objects/") {
                     // New git objects often means a commit happened
-                    self.update_last_commit(now);
+                    self.update_last_commit();
                 }
                 continue;
             }
@@ -280,7 +281,7 @@ impl WatState {
             .to_string()
     }
 
-    fn update_last_commit(&mut self, now: Instant) {
+    fn update_last_commit(&mut self) {
         let Some(repo) = &self.repo else {
             return;
         };
@@ -306,8 +307,9 @@ impl WatState {
                     .to_string();
 
                 let files = Self::get_commit_files(repo, &commit);
+                let commit_time = commit.time().seconds();
 
-                self.last_commit = Some((short_hash.to_string(), message, files, now));
+                self.last_commit = Some((short_hash.to_string(), message, files, commit_time));
             }
         }
     }
@@ -494,8 +496,9 @@ fn render(state: &mut WatState) -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     output.push_str(&format!("{BOLD}COMMIT{RESET}\r\n"));
 
-    if let Some((hash, message, files, time)) = &state.last_commit {
-        let elapsed_secs = time.elapsed().as_secs();
+    if let Some((hash, message, files, commit_timestamp)) = &state.last_commit {
+        let now_timestamp = Utc::now().timestamp();
+        let elapsed_secs = (now_timestamp - commit_timestamp).max(0) as u64;
         let (age_str, age_color) = format_relative_time(elapsed_secs);
 
         // Hash and age
