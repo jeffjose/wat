@@ -59,6 +59,7 @@ struct WatState {
     last_git_activity: Option<(String, Instant)>,
     workdir: PathBuf,
     ignored_dirs: HashMap<String, Instant>,  // Track activity in ignored directories
+    last_commit: Option<(String, String, Instant)>,  // (hash, message, time)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,6 +76,25 @@ impl WatState {
             .as_ref()
             .and_then(|r| r.workdir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| path.to_path_buf());
+
+        // Get initial last commit
+        let last_commit = repo.as_ref().and_then(|r| {
+            r.head().ok().and_then(|head| {
+                head.peel_to_commit().ok().map(|commit| {
+                    let hash = commit.id().to_string();
+                    let short_hash = hash[..7.min(hash.len())].to_string();
+                    let message = commit
+                        .message()
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    (short_hash, message, Instant::now() - Duration::from_secs(3600)) // Mark as old
+                })
+            })
+        });
+
         Self {
             repo,
             recent_changes: Vec::new(),
@@ -82,6 +102,7 @@ impl WatState {
             last_git_activity: None,
             workdir,
             ignored_dirs: HashMap::new(),
+            last_commit,
         }
     }
 
@@ -113,8 +134,15 @@ impl WatState {
                     self.last_git_activity = Some(("staging".to_string(), now));
                 } else if path.to_string_lossy().contains("COMMIT_EDITMSG") {
                     self.last_git_activity = Some(("committing".to_string(), now));
-                } else if path.to_string_lossy().ends_with(".git/HEAD") {
+                } else if path.to_string_lossy().ends_with(".git/HEAD")
+                    || path.to_string_lossy().contains("refs/heads")
+                {
                     self.last_git_activity = Some(("branch change".to_string(), now));
+                    // Check for new commit
+                    self.update_last_commit(now);
+                } else if path.to_string_lossy().contains("/objects/") {
+                    // New git objects often means a commit happened
+                    self.update_last_commit(now);
                 }
                 continue;
             }
@@ -177,15 +205,15 @@ impl WatState {
         Ok((stats.insertions(), stats.deletions()))
     }
 
-    fn get_git_status(&self) -> (i32, i32, i32) {
+    fn get_git_status(&self) -> (i32, i32, i32, usize, usize) {
         let Some(repo) = &self.repo else {
-            return (0, 0, 0);
+            return (0, 0, 0, 0, 0);
         };
 
         let mut opts = StatusOptions::new();
         opts.include_untracked(true);
 
-        let mut modified = 0;
+        let mut dirty = 0;
         let mut staged = 0;
         let mut untracked = 0;
 
@@ -193,7 +221,7 @@ impl WatState {
             for entry in statuses.iter() {
                 let status = entry.status();
                 if status.is_wt_modified() || status.is_wt_deleted() {
-                    modified += 1;
+                    dirty += 1;
                 }
                 if status.is_index_modified() || status.is_index_new() || status.is_index_deleted() {
                     staged += 1;
@@ -204,7 +232,42 @@ impl WatState {
             }
         }
 
-        (modified, staged, untracked)
+        // Get total diff stats
+        let (total_add, total_del) = self.get_total_diff_stats();
+
+        (dirty, staged, untracked, total_add, total_del)
+    }
+
+    fn get_total_diff_stats(&self) -> (usize, usize) {
+        let Some(repo) = &self.repo else {
+            return (0, 0);
+        };
+
+        // Staged changes (index vs HEAD)
+        let mut staged_add = 0;
+        let mut staged_del = 0;
+        if let Ok(head) = repo.head() {
+            if let Ok(tree) = head.peel_to_tree() {
+                if let Ok(diff) = repo.diff_tree_to_index(Some(&tree), None, None) {
+                    if let Ok(stats) = diff.stats() {
+                        staged_add = stats.insertions();
+                        staged_del = stats.deletions();
+                    }
+                }
+            }
+        }
+
+        // Unstaged changes (workdir vs index)
+        let mut unstaged_add = 0;
+        let mut unstaged_del = 0;
+        if let Ok(diff) = repo.diff_index_to_workdir(None, None) {
+            if let Ok(stats) = diff.stats() {
+                unstaged_add = stats.insertions();
+                unstaged_del = stats.deletions();
+            }
+        }
+
+        (staged_add + unstaged_add, staged_del + unstaged_del)
     }
 
     fn relative_path(&self, path: &Path) -> String {
@@ -212,6 +275,36 @@ impl WatState {
             .unwrap_or(path)
             .to_string_lossy()
             .to_string()
+    }
+
+    fn update_last_commit(&mut self, now: Instant) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+
+        if let Ok(head) = repo.head() {
+            if let Ok(commit) = head.peel_to_commit() {
+                let hash = commit.id().to_string();
+                let short_hash = &hash[..7.min(hash.len())];
+
+                // Only update if this is a new commit
+                if let Some((existing_hash, _, _)) = &self.last_commit {
+                    if existing_hash == short_hash {
+                        return;
+                    }
+                }
+
+                let message = commit
+                    .message()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+
+                self.last_commit = Some((short_hash.to_string(), message, now));
+            }
+        }
     }
 }
 
@@ -243,32 +336,44 @@ fn render(state: &WatState) -> Result<()> {
 
     let mut output = String::new();
 
-    // Header
+    // Header: wat - /path/to/directory $time
     output.push_str(&format!(
-        "{BOLD}{CYAN}wat{RESET} {DIM}watching for LLM activity{RESET}  {DIM}{}{RESET}\r\n\r\n",
+        "{BOLD}{CYAN}wat{RESET} {DIM}-{RESET} {}  {DIM}{}{RESET}\r\n",
+        state.workdir.display(),
         Local::now().format("%H:%M:%S")
     ));
 
-    // Git status
-    let (modified, staged, untracked) = state.get_git_status();
-    output.push_str(&format!("{BOLD}git:{RESET} "));
+    // Git status line
+    let (dirty, staged, untracked, total_add, total_del) = state.get_git_status();
 
     if state.repo.is_none() {
         output.push_str(&format!("{DIM}not a git repo{RESET}"));
-    } else if modified == 0 && staged == 0 && untracked == 0 {
-        output.push_str(&format!("{GREEN}clean{RESET}"));
+    } else if dirty == 0 && staged == 0 && untracked == 0 {
+        // Clean - show nothing or minimal indicator
+        output.push_str(&format!("{DIM}clean{RESET}"));
     } else {
+        // Show +lines -lines in colors first
+        if total_add > 0 || total_del > 0 {
+            output.push_str(&format!("{GREEN}+{total_add}{RESET} {RED}-{total_del}{RESET}"));
+        }
+
+        // Then file counts: dirty:N staged:N ?:N
         let mut parts = Vec::new();
-        if modified > 0 {
-            parts.push(format!("{YELLOW}~{modified}{RESET}"));
+        if dirty > 0 {
+            parts.push(format!("{YELLOW}dirty:{dirty}{RESET}"));
         }
         if staged > 0 {
-            parts.push(format!("{GREEN}+{staged} staged{RESET}"));
+            parts.push(format!("{GREEN}staged:{staged}{RESET}"));
         }
         if untracked > 0 {
-            parts.push(format!("{DIM}?{untracked}{RESET}"));
+            parts.push(format!("{DIM}?:{untracked}{RESET}"));
         }
-        output.push_str(&parts.join(" "));
+        if !parts.is_empty() {
+            if total_add > 0 || total_del > 0 {
+                output.push_str("  ");
+            }
+            output.push_str(&parts.join(" "));
+        }
     }
 
     // Git activity indicator
@@ -277,13 +382,32 @@ fn render(state: &WatState) -> Result<()> {
             output.push_str(&format!("  {MAGENTA}{activity}{RESET}"));
         }
     }
-    output.push_str("\r\n\r\n");
+    output.push_str("\r\n");
 
-    // Recent changes header
-    output.push_str(&format!("{BOLD}changes:{RESET}\r\n"));
+    // Show last commit (recent commits within 60 seconds, or always show the latest)
+    if let Some((hash, message, time)) = &state.last_commit {
+        let elapsed = time.elapsed().as_secs();
+        let age_indicator = if elapsed < 60 {
+            format!("{GREEN}{elapsed}s ago{RESET}")
+        } else {
+            format!("{DIM}{hash}{RESET}")
+        };
+        // Truncate message if too long
+        let max_msg_len = (term_width as usize).saturating_sub(25);
+        let display_msg = if message.len() > max_msg_len {
+            format!("{}...", &message[..max_msg_len.saturating_sub(3)])
+        } else {
+            message.clone()
+        };
+        output.push_str(&format!(
+            "{DIM}last commit:{RESET} {age_indicator} {display_msg}\r\n"
+        ));
+    }
+    output.push_str("\r\n");
 
+    // Recent changes - no header, just show content
     if state.recent_changes.is_empty() {
-        output.push_str(&format!("  {DIM}(waiting for file changes...){RESET}\r\n"));
+        output.push_str(&format!("{DIM}Nothing{RESET}\r\n"));
     } else {
         // Group by file and show most recent
         let mut by_file: HashMap<PathBuf, &FileChange> = HashMap::new();
@@ -299,7 +423,8 @@ fn render(state: &WatState) -> Result<()> {
         }
 
         let mut files: Vec<_> = by_file.into_iter().collect();
-        files.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        // Sort by path for consistent ordering (no jumping around)
+        files.sort_by(|a, b| a.0.cmp(&b.0));
 
         let max_files = (term_height as usize).saturating_sub(8).min(20);
 
