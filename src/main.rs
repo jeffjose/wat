@@ -349,9 +349,22 @@ fn setup_watcher(path: &Path) -> Result<(RecommendedWatcher, Receiver<notify::Re
     Ok((watcher, rx))
 }
 
+fn format_relative_time(secs: u64) -> (String, &'static str) {
+    if secs < 60 {
+        (format!("{}s", secs), GREEN)
+    } else if secs < 3600 {
+        (format!("{}m", secs / 60), YELLOW)
+    } else if secs < 86400 {
+        (format!("{}h", secs / 3600), DIM)
+    } else {
+        (format!("{}d", secs / 86400), DIM)
+    }
+}
+
 fn render(state: &WatState) -> Result<()> {
     let mut stdout = stdout();
     let (term_width, term_height) = terminal::size().unwrap_or((80, 24));
+    let width = term_width as usize;
 
     // Clear and move to top
     execute!(
@@ -362,96 +375,109 @@ fn render(state: &WatState) -> Result<()> {
 
     let mut output = String::new();
 
-    // Header: wat - /path/to/directory $time
-    output.push_str(&format!(
-        "{BOLD}{CYAN}wat{RESET} {DIM}-{RESET} {}  {DIM}{}{RESET}\r\n",
-        state.workdir.display(),
-        Local::now().format("%H:%M:%S")
-    ));
+    // ═══════════════════════════════════════════════════════════════════════
+    // HEADER BAR
+    // ═══════════════════════════════════════════════════════════════════════
+    let path_str = state.workdir.to_string_lossy();
+    let time_str = Local::now().format("%H:%M:%S").to_string();
+    let title = format!(" wat │ {} ", path_str);
+    let padding = width.saturating_sub(title.len() + time_str.len() + 1);
 
-    // Git status section
+    output.push_str(&format!(
+        "{BOLD}{CYAN}{}{RESET}{}{DIM}{}{RESET}\r\n",
+        title,
+        " ".repeat(padding),
+        time_str
+    ));
+    output.push_str(&format!("{DIM}{}{RESET}\r\n", "─".repeat(width)));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GIT STATUS (compact, single line when possible)
+    // ═══════════════════════════════════════════════════════════════════════
     let (dirty, staged, untracked, total_add, total_del) = state.get_git_status();
 
-    output.push_str(&format!("{BOLD}git{RESET}"));
-    // Git activity indicator on same line as header
-    if let Some((activity, time)) = &state.last_git_activity {
-        if time.elapsed() < Duration::from_secs(5) {
-            output.push_str(&format!(" {MAGENTA}{activity}{RESET}"));
-        }
-    }
-    output.push_str("\r\n");
+    output.push_str(&format!("{BOLD}GIT{RESET}  "));
 
     if state.repo.is_none() {
-        output.push_str(&format!("  {DIM}not a git repo{RESET}\r\n"));
+        output.push_str(&format!("{DIM}not a repo{RESET}"));
     } else if dirty == 0 && staged == 0 && untracked == 0 {
-        output.push_str(&format!("  {DIM}clean{RESET}\r\n"));
+        output.push_str(&format!("{GREEN}✓{RESET} {DIM}clean{RESET}"));
     } else {
-        output.push_str("  ");
-        // Show +lines -lines in colors first
+        // Line changes
         if total_add > 0 || total_del > 0 {
-            output.push_str(&format!("{GREEN}+{total_add}{RESET} {RED}-{total_del}{RESET}"));
+            output.push_str(&format!("{GREEN}+{:<5}{RESET} {RED}-{:<5}{RESET}  ", total_add, total_del));
         }
-
-        // Then file counts: dirty:N staged:N ?:N
-        let mut parts = Vec::new();
+        // File counts
         if dirty > 0 {
-            parts.push(format!("{YELLOW}dirty:{dirty}{RESET}"));
+            output.push_str(&format!("{YELLOW}●{dirty}{RESET} "));
         }
         if staged > 0 {
-            parts.push(format!("{GREEN}staged:{staged}{RESET}"));
+            output.push_str(&format!("{GREEN}◆{staged}{RESET} "));
         }
         if untracked > 0 {
-            parts.push(format!("{DIM}?:{untracked}{RESET}"));
+            output.push_str(&format!("{DIM}?{untracked}{RESET} "));
         }
-        if !parts.is_empty() {
-            if total_add > 0 || total_del > 0 {
-                output.push_str("  ");
-            }
-            output.push_str(&parts.join(" "));
-        }
-        output.push_str("\r\n");
     }
-    output.push_str("\r\n");
 
-    // Last commit section
-    output.push_str(&format!("{BOLD}commit{RESET}\r\n"));
+    // Git activity indicator
+    if let Some((activity, time)) = &state.last_git_activity {
+        if time.elapsed() < Duration::from_secs(5) {
+            output.push_str(&format!(" {MAGENTA}[{activity}]{RESET}"));
+        }
+    }
+    output.push_str("\r\n\r\n");
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LAST COMMIT
+    // ═══════════════════════════════════════════════════════════════════════
+    output.push_str(&format!("{BOLD}COMMIT{RESET}\r\n"));
+
     if let Some((hash, message, files, time)) = &state.last_commit {
         let elapsed_secs = time.elapsed().as_secs();
-        let age_str = if elapsed_secs < 60 {
-            format!("{GREEN}{}s{RESET}", elapsed_secs)
-        } else if elapsed_secs < 3600 {
-            format!("{YELLOW}{}m{RESET}", elapsed_secs / 60)
-        } else {
-            format!("{DIM}{}h{RESET}", elapsed_secs / 3600)
-        };
+        let (age_str, age_color) = format_relative_time(elapsed_secs);
 
-        // Truncate message if too long
-        let max_msg_len = (term_width as usize).saturating_sub(20);
+        // Hash and age
+        output.push_str(&format!(
+            "  {YELLOW}{hash}{RESET}  {age_color}{:>4}{RESET}\r\n",
+            age_str
+        ));
+
+        // Message (truncated if needed)
+        let max_msg_len = width.saturating_sub(4);
         let display_msg = if message.len() > max_msg_len {
-            format!("{}...", &message[..max_msg_len.saturating_sub(3)])
+            format!("{}…", &message[..max_msg_len.saturating_sub(1)])
         } else {
             message.clone()
         };
-        output.push_str(&format!(
-            "  {DIM}{hash}{RESET} {age_str} {display_msg}\r\n"
-        ));
+        output.push_str(&format!("  {display_msg}\r\n"));
 
-        // Show files
-        for file in files.iter().take(5) {
-            output.push_str(&format!("  {DIM}{file}{RESET}\r\n"));
-        }
-        if files.len() > 5 {
-            output.push_str(&format!("  {DIM}... and {} more{RESET}\r\n", files.len() - 5));
+        // Files
+        if !files.is_empty() {
+            output.push_str(&format!("  {DIM}"));
+            let max_commit_files = 3;
+            for (i, file) in files.iter().take(max_commit_files).enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(file);
+            }
+            if files.len() > max_commit_files {
+                output.push_str(&format!(" +{}", files.len() - max_commit_files));
+            }
+            output.push_str(&format!("{RESET}\r\n"));
         }
     } else {
-        output.push_str(&format!("  {DIM}none{RESET}\r\n"));
+        output.push_str(&format!("  {DIM}—{RESET}\r\n"));
     }
     output.push_str("\r\n");
 
-    // Recent changes section
-    output.push_str(&format!("{BOLD}changes{RESET}\r\n"));
+    // ═══════════════════════════════════════════════════════════════════════
+    // RECENT CHANGES
+    // ═══════════════════════════════════════════════════════════════════════
+    output.push_str(&format!("{BOLD}CHANGES{RESET}\r\n"));
+
     if state.recent_changes.is_empty() {
-        output.push_str(&format!("  {DIM}none{RESET}\r\n"));
+        output.push_str(&format!("  {DIM}—{RESET}\r\n"));
     } else {
         // Group by file and show most recent
         let mut by_file: HashMap<PathBuf, &FileChange> = HashMap::new();
@@ -467,79 +493,102 @@ fn render(state: &WatState) -> Result<()> {
         }
 
         let mut files: Vec<_> = by_file.into_iter().collect();
-        // Sort by path for consistent ordering (no jumping around)
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let max_files = (term_height as usize).saturating_sub(8).min(20);
+        // Calculate available space for changes section
+        let header_lines = 8; // Rough estimate of lines used above
+        let footer_lines = 3;
+        let max_files = (term_height as usize)
+            .saturating_sub(header_lines + footer_lines)
+            .min(15);
 
         for (path, change) in files.iter().take(max_files) {
             let elapsed = change.timestamp.elapsed().as_secs();
 
-            // Age color
-            let age_color = if elapsed < 3 {
-                GREEN
-            } else if elapsed < 10 {
-                YELLOW
-            } else {
-                DIM
-            };
-
             // Change type indicator
             let (indicator, ind_color) = match change.change_type {
-                ChangeType::Created => ("+", GREEN),
-                ChangeType::Modified => ("~", YELLOW),
-                ChangeType::Deleted => ("-", RED),
+                ChangeType::Created => ("▪", GREEN),
+                ChangeType::Modified => ("▪", YELLOW),
+                ChangeType::Deleted => ("▪", RED),
             };
 
             let rel_path = state.relative_path(path);
 
-            // Truncate path if too long
-            let max_path_len = (term_width as usize).saturating_sub(25);
+            // Build the line: "  ▪ path/to/file          3s  +10 -5"
+            let stats_str = if let Some(stats) = state.file_stats.get(path) {
+                if stats.additions > 0 || stats.deletions > 0 {
+                    format!("{GREEN}+{}{RESET} {RED}-{}{RESET}", stats.additions, stats.deletions)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            let (time_str, time_color) = format_relative_time(elapsed);
+
+            // Calculate path truncation
+            let fixed_width = 12; // "  ▪ " + time + spacing
+            let stats_width = if stats_str.is_empty() { 0 } else { 12 };
+            let max_path_len = width.saturating_sub(fixed_width + stats_width);
+
             let display_path = if rel_path.len() > max_path_len {
-                format!("...{}", &rel_path[rel_path.len() - max_path_len + 3..])
+                format!("…{}", &rel_path[rel_path.len().saturating_sub(max_path_len - 1)..])
             } else {
                 rel_path
             };
 
             output.push_str(&format!(
-                "  {age_color}{:>2}s{RESET} {ind_color}{indicator}{RESET} {display_path}",
-                elapsed
+                "  {ind_color}{indicator}{RESET} {display_path}"
             ));
 
-            // Show diff stats if available
-            if let Some(stats) = state.file_stats.get(path) {
-                if stats.additions > 0 || stats.deletions > 0 {
-                    output.push_str(&format!(
-                        " {GREEN}+{}{RESET} {RED}-{}{RESET}",
-                        stats.additions, stats.deletions
-                    ));
-                }
-            }
+            // Right-align time and stats
+            let current_len = 4 + display_path.len(); // "  ▪ " + path
+            let right_content = if stats_str.is_empty() {
+                format!("{time_color}{:>4}{RESET}", time_str)
+            } else {
+                format!("{time_color}{:>4}{RESET}  {}", time_str, stats_str)
+            };
+            let right_len = if stats_str.is_empty() { 4 } else { 4 + 2 + 8 }; // approximate
+            let pad = width.saturating_sub(current_len + right_len + 1);
 
-            output.push_str("\r\n");
+            output.push_str(&format!("{}{}\r\n", " ".repeat(pad), right_content));
         }
 
         if files.len() > max_files {
             output.push_str(&format!(
-                "  {DIM}... and {} more{RESET}\r\n",
+                "  {DIM}… {} more{RESET}\r\n",
                 files.len() - max_files
             ));
         }
     }
 
-    // Show ignored directory activity
+    // ═══════════════════════════════════════════════════════════════════════
+    // IGNORED ACTIVITY (if any)
+    // ═══════════════════════════════════════════════════════════════════════
     if !state.ignored_dirs.is_empty() {
+        output.push_str("\r\n");
         let mut dirs: Vec<_> = state.ignored_dirs.iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(a.1));
-        let dir_names: Vec<_> = dirs.iter().map(|(name, _)| format!("{}/", name)).collect();
+        let dir_names: Vec<_> = dirs.iter().map(|(name, _)| name.as_str()).collect();
         output.push_str(&format!(
-            "\r\n{DIM}ignored: {}{RESET}\r\n",
-            dir_names.join(" ")
+            "{DIM}building: {}{RESET}\r\n",
+            dir_names.join(", ")
         ));
     }
 
-    // Footer
-    output.push_str(&format!("\r\n{DIM}q to quit{RESET}"));
+    // ═══════════════════════════════════════════════════════════════════════
+    // FOOTER
+    // ═══════════════════════════════════════════════════════════════════════
+    // Move to bottom of screen for status bar
+    let content_lines = output.matches("\r\n").count();
+    let remaining = (term_height as usize).saturating_sub(content_lines + 1);
+    for _ in 0..remaining {
+        output.push_str("\r\n");
+    }
+
+    output.push_str(&format!("{DIM}{}{RESET}\r\n", "─".repeat(width)));
+    output.push_str(&format!("{DIM}q{RESET} quit"));
 
     print!("{}", output);
     stdout.flush()?;
