@@ -444,41 +444,46 @@ fn render(state: &mut WatState) -> Result<()> {
     ));
     output.push_str(&format!("{DIM}{}{RESET}\r\n", "-".repeat(width)));
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // GIT STATUS (compact, single line when possible)
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
+    // GIT STATUS (compact, single line)
+    // -----------------------------------------------------------------------
     let (dirty, staged, untracked, total_add, total_del) = state.get_git_status();
 
-    output.push_str(&format!("{BOLD}GIT{RESET}  "));
+    let mut git_line = format!("{BOLD}GIT{RESET}  ");
 
     if state.repo.is_none() {
-        output.push_str(&format!("{DIM}not a repo{RESET}"));
+        git_line.push_str(&format!("{DIM}not a repo{RESET}"));
     } else if dirty == 0 && staged == 0 && untracked == 0 {
-        output.push_str(&format!("{GREEN}ok{RESET} {DIM}clean{RESET}"));
+        git_line.push_str(&format!("{GREEN}ok{RESET} {DIM}clean{RESET}"));
     } else {
         // Line changes
         if total_add > 0 || total_del > 0 {
-            output.push_str(&format!("{GREEN}+{:<5}{RESET} {RED}-{:<5}{RESET}  ", total_add, total_del));
+            git_line.push_str(&format!("{GREEN}+{:<5}{RESET} {RED}-{:<5}{RESET}  ", total_add, total_del));
         }
         // File counts
         if dirty > 0 {
-            output.push_str(&format!("{YELLOW}*{dirty}{RESET} "));
+            git_line.push_str(&format!("{YELLOW}*{dirty}{RESET} "));
         }
         if staged > 0 {
-            output.push_str(&format!("{GREEN}+{staged}{RESET} "));
+            git_line.push_str(&format!("{GREEN}+{staged}{RESET} "));
         }
         if untracked > 0 {
-            output.push_str(&format!("{DIM}?{untracked}{RESET} "));
+            git_line.push_str(&format!("{DIM}?{untracked}{RESET} "));
         }
     }
 
     // Git activity indicator
     if let Some((activity, time)) = &state.last_git_activity {
         if time.elapsed() < Duration::from_secs(5) {
-            output.push_str(&format!(" {MAGENTA}[{activity}]{RESET}"));
+            git_line.push_str(&format!(" {MAGENTA}[{activity}]{RESET}"));
         }
     }
-    output.push_str("\r\n\r\n");
+
+    // Pad to full width and add
+    let git_visible_len = 5 + 15 + 10; // rough estimate
+    let git_pad = width.saturating_sub(git_visible_len);
+    output.push_str(&git_line);
+    output.push_str(&format!("{}\r\n\r\n", " ".repeat(git_pad)));
 
     // ═══════════════════════════════════════════════════════════════════════
     // LAST COMMIT
