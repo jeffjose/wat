@@ -60,6 +60,7 @@ struct WatState {
     workdir: PathBuf,
     ignored_dirs: HashMap<String, Instant>,  // Track activity in ignored directories
     last_commit: Option<(String, String, Vec<String>, Instant)>,  // (hash, message, files, time)
+    render_count: usize,  // For spinner animation
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,6 +105,7 @@ impl WatState {
             workdir,
             ignored_dirs: HashMap::new(),
             last_commit,
+            render_count: 0,
         }
     }
 
@@ -385,10 +387,13 @@ fn format_diff_bar(additions: usize, deletions: usize, max_width: usize) -> Stri
     format!("{GREEN}{add_bar}{RESET}{RED}{del_bar}{RESET}")
 }
 
-fn render(state: &WatState) -> Result<()> {
+fn render(state: &mut WatState) -> Result<()> {
     let mut stdout = stdout();
     let (term_width, term_height) = terminal::size().unwrap_or((80, 24));
     let width = term_width as usize;
+
+    // Increment render count for spinner
+    state.render_count = state.render_count.wrapping_add(1);
 
     // Move cursor home (no clear - prevents flicker)
     queue!(stdout, cursor::MoveTo(0, 0))?;
@@ -400,12 +405,40 @@ fn render(state: &WatState) -> Result<()> {
     // -----------------------------------------------------------------------
     let path_str = state.workdir.to_string_lossy();
     let time_str = Local::now().format("%H:%M:%S").to_string();
-    let title = format!(" wat | {} ", path_str);
-    let padding = width.saturating_sub(title.len() + time_str.len() + 1);
+
+    // Build status with spinner (if building)
+    let build_status = if !state.ignored_dirs.is_empty() {
+        let spinner = ['|', '/', '-', '\\'][state.render_count % 4];
+        let lang = state.ignored_dirs.keys().find_map(|name| {
+            match name.as_str() {
+                "target" => Some("rust"),
+                "node_modules" | "dist" | ".next" | ".nuxt" => Some("js"),
+                "__pycache__" | ".venv" | "venv" | ".pyc" | "site-packages" => Some("python"),
+                ".gradle" | "build" => Some("java"),
+                "vendor" => Some("go"),
+                "_build" | "deps" => Some("elixir"),
+                "zig-cache" | "zig-out" => Some("zig"),
+                ".dart_tool" => Some("dart"),
+                "Pods" => Some("swift"),
+                _ => None,
+            }
+        });
+        match lang {
+            Some(l) => format!(" {YELLOW}[{} {}]{RESET}", spinner, l),
+            None => format!(" {YELLOW}[{}]{RESET}", spinner),
+        }
+    } else {
+        String::new()
+    };
+
+    let title = format!(" wat | {}", path_str);
+    let status_display_len = if state.ignored_dirs.is_empty() { 0 } else { 10 }; // approx
+    let padding = width.saturating_sub(title.len() + status_display_len + time_str.len() + 2);
 
     output.push_str(&format!(
-        "{BOLD}{CYAN}{}{RESET}{}{DIM}{}{RESET}\r\n",
+        "{BOLD}{CYAN}{}{RESET}{}{}{DIM}{}{RESET}\r\n",
         title,
+        build_status,
         " ".repeat(padding),
         time_str
     ));
@@ -585,39 +618,6 @@ fn render(state: &WatState) -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // IGNORED ACTIVITY (if any)
-    // -----------------------------------------------------------------------
-    if !state.ignored_dirs.is_empty() {
-        output.push_str("\r\n");
-        let mut dirs: Vec<_> = state.ignored_dirs.iter().collect();
-        dirs.sort_by(|a, b| b.1.cmp(a.1));
-
-        // Detect language from directory
-        let lang = dirs.iter().find_map(|(name, _)| {
-            match name.as_str() {
-                "target" => Some("rust"),
-                "node_modules" | "dist" | ".next" | ".nuxt" => Some("js"),
-                "__pycache__" | ".venv" | "venv" | ".pyc" | "site-packages" => Some("python"),
-                ".gradle" | "build" => Some("java"),
-                "vendor" => Some("go"),
-                "_build" | "deps" => Some("elixir"),
-                "zig-cache" | "zig-out" => Some("zig"),
-                ".dart_tool" => Some("dart"),
-                "Pods" => Some("swift"),
-                _ => None,
-            }
-        });
-
-        let label = match lang {
-            Some(l) => format!("building {}", l),
-            None => "building".to_string(),
-        };
-
-        let pad = width.saturating_sub(label.len());
-        output.push_str(&format!("{DIM}{}{}{RESET}\r\n", label, " ".repeat(pad)));
-    }
-
-    // -----------------------------------------------------------------------
     // FOOTER
     // -----------------------------------------------------------------------
     // Move to bottom of screen for status bar
@@ -671,7 +671,7 @@ fn run(path: &Path, interval: u64) -> Result<()> {
         }
 
         // Render
-        render(&state)?;
+        render(&mut state)?;
 
         // Check for quit
         if event::poll(Duration::from_millis(interval))? {
