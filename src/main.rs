@@ -59,7 +59,7 @@ struct WatState {
     last_git_activity: Option<(String, Instant)>,
     workdir: PathBuf,
     ignored_dirs: HashMap<String, Instant>,  // Track activity in ignored directories
-    last_commit: Option<(String, String, Instant)>,  // (hash, message, time)
+    last_commit: Option<(String, String, Vec<String>, Instant)>,  // (hash, message, files, time)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,7 +90,8 @@ impl WatState {
                         .next()
                         .unwrap_or("")
                         .to_string();
-                    (short_hash, message, Instant::now() - Duration::from_secs(3600)) // Mark as old
+                    let files = Self::get_commit_files(r, &commit);
+                    (short_hash, message, files, Instant::now() - Duration::from_secs(3600)) // Mark as old
                 })
             })
         });
@@ -288,7 +289,7 @@ impl WatState {
                 let short_hash = &hash[..7.min(hash.len())];
 
                 // Only update if this is a new commit
-                if let Some((existing_hash, _, _)) = &self.last_commit {
+                if let Some((existing_hash, _, _, _)) = &self.last_commit {
                     if existing_hash == short_hash {
                         return;
                     }
@@ -302,9 +303,34 @@ impl WatState {
                     .unwrap_or("")
                     .to_string();
 
-                self.last_commit = Some((short_hash.to_string(), message, now));
+                let files = Self::get_commit_files(repo, &commit);
+
+                self.last_commit = Some((short_hash.to_string(), message, files, now));
             }
         }
+    }
+
+    fn get_commit_files(repo: &Repository, commit: &git2::Commit) -> Vec<String> {
+        let mut files = Vec::new();
+
+        // Get the commit's tree
+        let Ok(tree) = commit.tree() else {
+            return files;
+        };
+
+        // Get parent tree (or empty tree for first commit)
+        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+
+        // Diff between parent and this commit
+        if let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
+            for delta in diff.deltas() {
+                if let Some(path) = delta.new_file().path() {
+                    files.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        files
     }
 }
 
@@ -343,15 +369,24 @@ fn render(state: &WatState) -> Result<()> {
         Local::now().format("%H:%M:%S")
     ));
 
-    // Git status line
+    // Git status section
     let (dirty, staged, untracked, total_add, total_del) = state.get_git_status();
 
+    output.push_str(&format!("{BOLD}git{RESET}"));
+    // Git activity indicator on same line as header
+    if let Some((activity, time)) = &state.last_git_activity {
+        if time.elapsed() < Duration::from_secs(5) {
+            output.push_str(&format!(" {MAGENTA}{activity}{RESET}"));
+        }
+    }
+    output.push_str("\r\n");
+
     if state.repo.is_none() {
-        output.push_str(&format!("{DIM}not a git repo{RESET}"));
+        output.push_str(&format!("  {DIM}not a git repo{RESET}\r\n"));
     } else if dirty == 0 && staged == 0 && untracked == 0 {
-        // Clean - show nothing or minimal indicator
-        output.push_str(&format!("{DIM}clean{RESET}"));
+        output.push_str(&format!("  {DIM}clean{RESET}\r\n"));
     } else {
+        output.push_str("  ");
         // Show +lines -lines in colors first
         if total_add > 0 || total_del > 0 {
             output.push_str(&format!("{GREEN}+{total_add}{RESET} {RED}-{total_del}{RESET}"));
@@ -374,40 +409,49 @@ fn render(state: &WatState) -> Result<()> {
             }
             output.push_str(&parts.join(" "));
         }
-    }
-
-    // Git activity indicator
-    if let Some((activity, time)) = &state.last_git_activity {
-        if time.elapsed() < Duration::from_secs(5) {
-            output.push_str(&format!("  {MAGENTA}{activity}{RESET}"));
-        }
+        output.push_str("\r\n");
     }
     output.push_str("\r\n");
 
-    // Show last commit (recent commits within 60 seconds, or always show the latest)
-    if let Some((hash, message, time)) = &state.last_commit {
-        let elapsed = time.elapsed().as_secs();
-        let age_indicator = if elapsed < 60 {
-            format!("{GREEN}{elapsed}s ago{RESET}")
+    // Last commit section
+    output.push_str(&format!("{BOLD}commit{RESET}\r\n"));
+    if let Some((hash, message, files, time)) = &state.last_commit {
+        let elapsed_secs = time.elapsed().as_secs();
+        let age_str = if elapsed_secs < 60 {
+            format!("{GREEN}{}s{RESET}", elapsed_secs)
+        } else if elapsed_secs < 3600 {
+            format!("{YELLOW}{}m{RESET}", elapsed_secs / 60)
         } else {
-            format!("{DIM}{hash}{RESET}")
+            format!("{DIM}{}h{RESET}", elapsed_secs / 3600)
         };
+
         // Truncate message if too long
-        let max_msg_len = (term_width as usize).saturating_sub(25);
+        let max_msg_len = (term_width as usize).saturating_sub(20);
         let display_msg = if message.len() > max_msg_len {
             format!("{}...", &message[..max_msg_len.saturating_sub(3)])
         } else {
             message.clone()
         };
         output.push_str(&format!(
-            "{DIM}last commit:{RESET} {age_indicator} {display_msg}\r\n"
+            "  {DIM}{hash}{RESET} {age_str} {display_msg}\r\n"
         ));
+
+        // Show files
+        for file in files.iter().take(5) {
+            output.push_str(&format!("  {DIM}{file}{RESET}\r\n"));
+        }
+        if files.len() > 5 {
+            output.push_str(&format!("  {DIM}... and {} more{RESET}\r\n", files.len() - 5));
+        }
+    } else {
+        output.push_str(&format!("  {DIM}none{RESET}\r\n"));
     }
     output.push_str("\r\n");
 
-    // Recent changes - no header, just show content
+    // Recent changes section
+    output.push_str(&format!("{BOLD}changes{RESET}\r\n"));
     if state.recent_changes.is_empty() {
-        output.push_str(&format!("{DIM}Nothing{RESET}\r\n"));
+        output.push_str(&format!("  {DIM}none{RESET}\r\n"));
     } else {
         // Group by file and show most recent
         let mut by_file: HashMap<PathBuf, &FileChange> = HashMap::new();
