@@ -4,8 +4,8 @@ use clap::Parser;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{self, ClearType},
+    execute, queue,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use git2::{DiffOptions, Repository, StatusOptions};
 use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
@@ -361,26 +361,46 @@ fn format_relative_time(secs: u64) -> (String, &'static str) {
     }
 }
 
+fn format_diff_bar(additions: usize, deletions: usize, max_width: usize) -> String {
+    if additions == 0 && deletions == 0 {
+        return String::new();
+    }
+
+    let total = additions + deletions;
+    let bar_width = max_width.min(10); // Max 10 chars for the bar
+
+    let add_chars = if total > 0 {
+        (additions * bar_width / total).max(if additions > 0 { 1 } else { 0 })
+    } else {
+        0
+    };
+    let del_chars = bar_width.saturating_sub(add_chars).max(if deletions > 0 { 1 } else { 0 });
+
+    // Adjust if we went over
+    let add_chars = add_chars.min(bar_width.saturating_sub(if deletions > 0 { 1 } else { 0 }));
+
+    let add_bar: String = std::iter::repeat('+').take(add_chars).collect();
+    let del_bar: String = std::iter::repeat('-').take(del_chars).collect();
+
+    format!("{GREEN}{add_bar}{RESET}{RED}{del_bar}{RESET}")
+}
+
 fn render(state: &WatState) -> Result<()> {
     let mut stdout = stdout();
     let (term_width, term_height) = terminal::size().unwrap_or((80, 24));
     let width = term_width as usize;
 
-    // Clear and move to top
-    execute!(
-        stdout,
-        terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
-    )?;
+    // Move cursor home (no clear - prevents flicker)
+    queue!(stdout, cursor::MoveTo(0, 0))?;
 
     let mut output = String::new();
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     // HEADER BAR
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     let path_str = state.workdir.to_string_lossy();
     let time_str = Local::now().format("%H:%M:%S").to_string();
-    let title = format!(" wat │ {} ", path_str);
+    let title = format!(" wat | {} ", path_str);
     let padding = width.saturating_sub(title.len() + time_str.len() + 1);
 
     output.push_str(&format!(
@@ -389,7 +409,7 @@ fn render(state: &WatState) -> Result<()> {
         " ".repeat(padding),
         time_str
     ));
-    output.push_str(&format!("{DIM}{}{RESET}\r\n", "─".repeat(width)));
+    output.push_str(&format!("{DIM}{}{RESET}\r\n", "-".repeat(width)));
 
     // ═══════════════════════════════════════════════════════════════════════
     // GIT STATUS (compact, single line when possible)
@@ -401,7 +421,7 @@ fn render(state: &WatState) -> Result<()> {
     if state.repo.is_none() {
         output.push_str(&format!("{DIM}not a repo{RESET}"));
     } else if dirty == 0 && staged == 0 && untracked == 0 {
-        output.push_str(&format!("{GREEN}✓{RESET} {DIM}clean{RESET}"));
+        output.push_str(&format!("{GREEN}ok{RESET} {DIM}clean{RESET}"));
     } else {
         // Line changes
         if total_add > 0 || total_del > 0 {
@@ -409,10 +429,10 @@ fn render(state: &WatState) -> Result<()> {
         }
         // File counts
         if dirty > 0 {
-            output.push_str(&format!("{YELLOW}●{dirty}{RESET} "));
+            output.push_str(&format!("{YELLOW}*{dirty}{RESET} "));
         }
         if staged > 0 {
-            output.push_str(&format!("{GREEN}◆{staged}{RESET} "));
+            output.push_str(&format!("{GREEN}+{staged}{RESET} "));
         }
         if untracked > 0 {
             output.push_str(&format!("{DIM}?{untracked}{RESET} "));
@@ -445,7 +465,7 @@ fn render(state: &WatState) -> Result<()> {
         // Message (truncated if needed)
         let max_msg_len = width.saturating_sub(4);
         let display_msg = if message.len() > max_msg_len {
-            format!("{}…", &message[..max_msg_len.saturating_sub(1)])
+            format!("{}...", &message[..max_msg_len.saturating_sub(3)])
         } else {
             message.clone()
         };
@@ -467,17 +487,17 @@ fn render(state: &WatState) -> Result<()> {
             output.push_str(&format!("{RESET}\r\n"));
         }
     } else {
-        output.push_str(&format!("  {DIM}—{RESET}\r\n"));
+        output.push_str(&format!("  {DIM}--{RESET}\r\n"));
     }
     output.push_str("\r\n");
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     // RECENT CHANGES
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     output.push_str(&format!("{BOLD}CHANGES{RESET}\r\n"));
 
     if state.recent_changes.is_empty() {
-        output.push_str(&format!("  {DIM}—{RESET}\r\n"));
+        output.push_str(&format!("  {DIM}--{RESET}\r\n"));
     } else {
         // Group by file and show most recent
         let mut by_file: HashMap<PathBuf, &FileChange> = HashMap::new();
@@ -492,7 +512,12 @@ fn render(state: &WatState) -> Result<()> {
                 .or_insert(change);
         }
 
-        let mut files: Vec<_> = by_file.into_iter().collect();
+        let mut files: Vec<_> = by_file.into_iter()
+            // Filter out deleted files (they don't exist anymore)
+            .filter(|(path, change)| {
+                !matches!(change.change_type, ChangeType::Deleted) || path.exists()
+            })
+            .collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Calculate available space for changes section
@@ -507,20 +532,16 @@ fn render(state: &WatState) -> Result<()> {
 
             // Change type indicator
             let (indicator, ind_color) = match change.change_type {
-                ChangeType::Created => ("▪", GREEN),
-                ChangeType::Modified => ("▪", YELLOW),
-                ChangeType::Deleted => ("▪", RED),
+                ChangeType::Created => ("+", GREEN),
+                ChangeType::Modified => ("~", YELLOW),
+                ChangeType::Deleted => ("-", RED),
             };
 
             let rel_path = state.relative_path(path);
 
-            // Build the line: "  ▪ path/to/file          3s  +10 -5"
-            let stats_str = if let Some(stats) = state.file_stats.get(path) {
-                if stats.additions > 0 || stats.deletions > 0 {
-                    format!("{GREEN}+{}{RESET} {RED}-{}{RESET}", stats.additions, stats.deletions)
-                } else {
-                    String::new()
-                }
+            // Build diff bar graph
+            let stats_bar = if let Some(stats) = state.file_stats.get(path) {
+                format_diff_bar(stats.additions, stats.deletions, 8)
             } else {
                 String::new()
             };
@@ -528,12 +549,11 @@ fn render(state: &WatState) -> Result<()> {
             let (time_str, time_color) = format_relative_time(elapsed);
 
             // Calculate path truncation
-            let fixed_width = 12; // "  ▪ " + time + spacing
-            let stats_width = if stats_str.is_empty() { 0 } else { 12 };
-            let max_path_len = width.saturating_sub(fixed_width + stats_width);
+            let fixed_width = 18; // "  + " + time + bar + spacing
+            let max_path_len = width.saturating_sub(fixed_width);
 
             let display_path = if rel_path.len() > max_path_len {
-                format!("…{}", &rel_path[rel_path.len().saturating_sub(max_path_len - 1)..])
+                format!("..{}", &rel_path[rel_path.len().saturating_sub(max_path_len - 2)..])
             } else {
                 rel_path
             };
@@ -542,14 +562,15 @@ fn render(state: &WatState) -> Result<()> {
                 "  {ind_color}{indicator}{RESET} {display_path}"
             ));
 
-            // Right-align time and stats
-            let current_len = 4 + display_path.len(); // "  ▪ " + path
-            let right_content = if stats_str.is_empty() {
+            // Right-align time and bar
+            let current_len = 4 + display_path.len(); // "  + " + path
+            let bar_display_len = if stats_bar.is_empty() { 0 } else { 8 };
+            let right_content = if stats_bar.is_empty() {
                 format!("{time_color}{:>4}{RESET}", time_str)
             } else {
-                format!("{time_color}{:>4}{RESET}  {}", time_str, stats_str)
+                format!("{time_color}{:>4}{RESET} {}", time_str, stats_bar)
             };
-            let right_len = if stats_str.is_empty() { 4 } else { 4 + 2 + 8 }; // approximate
+            let right_len = 4 + if bar_display_len > 0 { 1 + bar_display_len } else { 0 };
             let pad = width.saturating_sub(current_len + right_len + 1);
 
             output.push_str(&format!("{}{}\r\n", " ".repeat(pad), right_content));
@@ -557,15 +578,15 @@ fn render(state: &WatState) -> Result<()> {
 
         if files.len() > max_files {
             output.push_str(&format!(
-                "  {DIM}… {} more{RESET}\r\n",
+                "  {DIM}.. {} more{RESET}\r\n",
                 files.len() - max_files
             ));
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     // IGNORED ACTIVITY (if any)
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     if !state.ignored_dirs.is_empty() {
         output.push_str("\r\n");
         let mut dirs: Vec<_> = state.ignored_dirs.iter().collect();
@@ -577,18 +598,23 @@ fn render(state: &WatState) -> Result<()> {
         ));
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     // FOOTER
-    // ═══════════════════════════════════════════════════════════════════════
+    // -----------------------------------------------------------------------
     // Move to bottom of screen for status bar
     let content_lines = output.matches("\r\n").count();
-    let remaining = (term_height as usize).saturating_sub(content_lines + 1);
+    let remaining = (term_height as usize).saturating_sub(content_lines + 2);
+
+    // Fill remaining space with blank lines (clears old content)
+    let blank_line = format!("{}\r\n", " ".repeat(width));
     for _ in 0..remaining {
-        output.push_str("\r\n");
+        output.push_str(&blank_line);
     }
 
-    output.push_str(&format!("{DIM}{}{RESET}\r\n", "─".repeat(width)));
-    output.push_str(&format!("{DIM}q{RESET} quit"));
+    output.push_str(&format!("{DIM}{}{RESET}\r\n", "-".repeat(width)));
+    let footer = format!("{DIM}q{RESET} quit");
+    let footer_pad = width.saturating_sub(6);
+    output.push_str(&format!("{}{}", footer, " ".repeat(footer_pad)));
 
     print!("{}", output);
     stdout.flush()?;
@@ -599,20 +625,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let path = args.path.canonicalize().context("Invalid path")?;
 
-    // Setup terminal
-    terminal::enable_raw_mode()?;
+    // Setup terminal with alternate screen (prevents flicker)
     let mut stdout = stdout();
-    execute!(stdout, cursor::Hide)?;
+    terminal::enable_raw_mode()?;
+    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
 
     let result = run(&path, args.interval);
 
     // Cleanup terminal
-    execute!(
-        stdout,
-        cursor::Show,
-        terminal::Clear(ClearType::All),
-        cursor::MoveTo(0, 0)
-    )?;
+    execute!(stdout, cursor::Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     result
