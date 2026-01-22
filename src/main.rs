@@ -591,11 +591,29 @@ fn render(state: &WatState) -> Result<()> {
         output.push_str("\r\n");
         let mut dirs: Vec<_> = state.ignored_dirs.iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(a.1));
-        let dir_names: Vec<_> = dirs.iter().map(|(name, _)| name.as_str()).collect();
-        output.push_str(&format!(
-            "{DIM}building: {}{RESET}\r\n",
-            dir_names.join(", ")
-        ));
+
+        // Detect language from directory
+        let lang = dirs.iter().find_map(|(name, _)| {
+            match name.as_str() {
+                "target" => Some("rust"),
+                "node_modules" | "dist" | ".next" | ".nuxt" => Some("js"),
+                "__pycache__" | ".venv" | "venv" | ".pyc" | "site-packages" => Some("python"),
+                ".gradle" | "build" => Some("java"),
+                "vendor" => Some("go"),
+                "_build" | "deps" => Some("elixir"),
+                "zig-cache" | "zig-out" => Some("zig"),
+                ".dart_tool" => Some("dart"),
+                "Pods" => Some("swift"),
+                _ => None,
+            }
+        });
+
+        let label = match lang {
+            Some(l) => format!("building {}", l),
+            None => "building".to_string(),
+        };
+
+        output.push_str(&format!("{DIM}{}{RESET}\r\n", label));
     }
 
     // -----------------------------------------------------------------------
