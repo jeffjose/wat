@@ -613,7 +613,8 @@ fn render(state: &WatState) -> Result<()> {
             None => "building".to_string(),
         };
 
-        output.push_str(&format!("{DIM}{}{RESET}\r\n", label));
+        let pad = width.saturating_sub(label.len());
+        output.push_str(&format!("{DIM}{}{}{RESET}\r\n", label, " ".repeat(pad)));
     }
 
     // -----------------------------------------------------------------------
