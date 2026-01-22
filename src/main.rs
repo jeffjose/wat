@@ -513,24 +513,8 @@ fn render(state: &WatState) -> Result<()> {
         }
 
         let mut files: Vec<_> = by_file.into_iter()
-            // Filter out files that no longer exist or are transient
-            .filter(|(path, _change)| {
-                // Must still exist
-                if !path.exists() {
-                    return false;
-                }
-                // Filter out temp/transient files
-                let path_str = path.to_string_lossy();
-                if path_str.contains(".tmp.")
-                    || path_str.contains(".swp")
-                    || path_str.ends_with("~")
-                    || path_str.contains(".#")
-                    || path_str.ends_with(".bak")
-                {
-                    return false;
-                }
-                true
-            })
+            // Only show files that still exist
+            .filter(|(path, _change)| path.exists())
             .collect();
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
