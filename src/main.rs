@@ -5,7 +5,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
     execute, queue,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use git2::{DiffOptions, Repository, StatusOptions};
 use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
@@ -395,8 +395,12 @@ fn render(state: &mut WatState) -> Result<()> {
     // Increment render count for spinner
     state.render_count = state.render_count.wrapping_add(1);
 
-    // Move cursor home (no clear - prevents flicker)
-    queue!(stdout, cursor::MoveTo(0, 0))?;
+    // Move cursor home and clear screen (alternate buffer prevents flicker)
+    queue!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::All)
+    )?;
 
     let mut output = String::new();
 
