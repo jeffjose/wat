@@ -528,8 +528,6 @@ fn render(state: &WatState) -> Result<()> {
             .min(15);
 
         for (path, change) in files.iter().take(max_files) {
-            let elapsed = change.timestamp.elapsed().as_secs();
-
             // Change type indicator
             let (indicator, ind_color) = match change.change_type {
                 ChangeType::Created => ("+", GREEN),
@@ -539,17 +537,24 @@ fn render(state: &WatState) -> Result<()> {
 
             let rel_path = state.relative_path(path);
 
-            // Build diff bar graph
-            let stats_bar = if let Some(stats) = state.file_stats.get(path) {
-                format_diff_bar(stats.additions, stats.deletions, 8)
+            // Get diff stats for this file
+            let (additions, deletions) = if let Some(stats) = state.file_stats.get(path) {
+                (stats.additions, stats.deletions)
+            } else {
+                (0, 0)
+            };
+
+            // Build the right side: "+45 -12 ++++++----"
+            let right_content = if additions > 0 || deletions > 0 {
+                let bar = format_diff_bar(additions, deletions, 8);
+                format!("{GREEN}+{:<4}{RESET} {RED}-{:<4}{RESET} {}", additions, deletions, bar)
             } else {
                 String::new()
             };
-
-            let (time_str, time_color) = format_relative_time(elapsed);
+            let right_display_len = if additions > 0 || deletions > 0 { 20 } else { 0 };
 
             // Calculate path truncation
-            let fixed_width = 18; // "  + " + time + bar + spacing
+            let fixed_width = 6 + right_display_len; // "  + " + right content + spacing
             let max_path_len = width.saturating_sub(fixed_width);
 
             let display_path = if rel_path.len() > max_path_len {
@@ -562,18 +567,15 @@ fn render(state: &WatState) -> Result<()> {
                 "  {ind_color}{indicator}{RESET} {display_path}"
             ));
 
-            // Right-align time and bar
+            // Right-align the stats
             let current_len = 4 + display_path.len(); // "  + " + path
-            let bar_display_len = if stats_bar.is_empty() { 0 } else { 8 };
-            let right_content = if stats_bar.is_empty() {
-                format!("{time_color}{:>4}{RESET}", time_str)
-            } else {
-                format!("{time_color}{:>4}{RESET} {}", time_str, stats_bar)
-            };
-            let right_len = 4 + if bar_display_len > 0 { 1 + bar_display_len } else { 0 };
-            let pad = width.saturating_sub(current_len + right_len + 1);
+            let pad = width.saturating_sub(current_len + right_display_len + 1);
 
-            output.push_str(&format!("{}{}\r\n", " ".repeat(pad), right_content));
+            if !right_content.is_empty() {
+                output.push_str(&format!("{}{}\r\n", " ".repeat(pad), right_content));
+            } else {
+                output.push_str(&format!("{}\r\n", " ".repeat(width.saturating_sub(current_len))));
+            }
         }
 
         if files.len() > max_files {
