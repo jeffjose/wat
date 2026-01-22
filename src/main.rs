@@ -424,15 +424,15 @@ fn render(state: &mut WatState) -> Result<()> {
             }
         });
         match lang {
-            Some(l) => format!(" {YELLOW}[{} {}]{RESET}", spinner, l),
-            None => format!(" {YELLOW}[{}]{RESET}", spinner),
+            Some(l) => format!(" {YELLOW}[building {} {}]{RESET}", l, spinner),
+            None => format!(" {YELLOW}[building {}]{RESET}", spinner),
         }
     } else {
         String::new()
     };
 
     let title = format!(" wat | {}", path_str);
-    let status_display_len = if state.ignored_dirs.is_empty() { 0 } else { 10 }; // approx
+    let status_display_len = if state.ignored_dirs.is_empty() { 0 } else { 18 }; // approx [building rust /]
     let padding = width.saturating_sub(title.len() + status_display_len + time_str.len() + 2);
 
     output.push_str(&format!(
