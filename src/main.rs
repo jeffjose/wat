@@ -12,6 +12,7 @@ use notify::{Config, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Wa
 use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ enum ChangeType {
 
 struct WatState {
     repo: Option<Repository>,
+    use_git_cli: bool,  // Fall back to git CLI when git2 fails
     recent_changes: Vec<FileChange>,
     file_stats: HashMap<PathBuf, FileStats>,
     last_git_activity: Option<(String, Instant)>,
@@ -72,14 +74,22 @@ struct FileStats {
 
 impl WatState {
     fn new(path: &Path) -> Self {
+        // Try git2 first
         let repo = Repository::discover(path).ok();
-        let workdir = repo
-            .as_ref()
-            .and_then(|r| r.workdir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| path.to_path_buf());
+
+        // Check if we need to fall back to git CLI
+        let use_git_cli = repo.is_none() && Self::is_git_repo_cli(path);
+
+        let workdir = if let Some(ref r) = repo {
+            r.workdir().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf())
+        } else if use_git_cli {
+            Self::get_git_root_cli(path).unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
 
         // Get initial last commit
-        let last_commit = repo.as_ref().and_then(|r| {
+        let last_commit = if let Some(ref r) = repo {
             r.head().ok().and_then(|head| {
                 head.peel_to_commit().ok().map(|commit| {
                     let hash = commit.id().to_string();
@@ -96,10 +106,15 @@ impl WatState {
                     (short_hash, message, files, commit_time)
                 })
             })
-        });
+        } else if use_git_cli {
+            Self::get_last_commit_cli(&workdir)
+        } else {
+            None
+        };
 
         Self {
             repo,
+            use_git_cli,
             recent_changes: Vec::new(),
             file_stats: HashMap::new(),
             last_git_activity: None,
@@ -110,12 +125,181 @@ impl WatState {
         }
     }
 
-    fn is_ignored(&self, path: &Path) -> bool {
-        let Some(repo) = &self.repo else {
-            return false;
+    // Git CLI helper functions
+    fn is_git_repo_cli(path: &Path) -> bool {
+        Command::new("git")
+            .args(["-C", &path.to_string_lossy(), "rev-parse", "--is-inside-work-tree"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn get_git_root_cli(path: &Path) -> Option<PathBuf> {
+        Command::new("git")
+            .args(["-C", &path.to_string_lossy(), "rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+    }
+
+    fn get_last_commit_cli(workdir: &Path) -> Option<(String, String, Vec<String>, i64)> {
+        // Get hash, message, and timestamp
+        let output = Command::new("git")
+            .args(["-C", &workdir.to_string_lossy(), "log", "-1", "--format=%h%n%s%n%ct"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let hash = lines.next()?.to_string();
+        let message = lines.next()?.to_string();
+        let timestamp: i64 = lines.next()?.parse().ok()?;
+
+        // Get files changed in last commit
+        let files_output = Command::new("git")
+            .args(["-C", &workdir.to_string_lossy(), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
+            .output()
+            .ok()?;
+
+        let files: Vec<String> = if files_output.status.success() {
+            String::from_utf8_lossy(&files_output.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
         };
+
+        Some((hash, message, files, timestamp))
+    }
+
+    fn get_git_status_cli(&self) -> (i32, i32, i32, usize, usize) {
+        // Get porcelain status
+        let output = Command::new("git")
+            .args(["-C", &self.workdir.to_string_lossy(), "status", "--porcelain"])
+            .output();
+
+        let Ok(output) = output else {
+            return (0, 0, 0, 0, 0);
+        };
+
+        if !output.status.success() {
+            return (0, 0, 0, 0, 0);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut dirty = 0;
+        let mut staged = 0;
+        let mut untracked = 0;
+
+        for line in stdout.lines() {
+            if line.len() < 2 {
+                continue;
+            }
+            let index_status = line.chars().next().unwrap_or(' ');
+            let worktree_status = line.chars().nth(1).unwrap_or(' ');
+
+            // Staged changes (index)
+            if matches!(index_status, 'A' | 'M' | 'D' | 'R' | 'C') {
+                staged += 1;
+            }
+
+            // Worktree changes (modified/deleted)
+            if matches!(worktree_status, 'M' | 'D') {
+                dirty += 1;
+            }
+
+            // Untracked files
+            if index_status == '?' {
+                untracked += 1;
+            }
+        }
+
+        // Get diff stats
+        let (total_add, total_del) = self.get_total_diff_stats_cli();
+
+        (dirty, staged, untracked, total_add, total_del)
+    }
+
+    fn get_total_diff_stats_cli(&self) -> (usize, usize) {
+        // Get combined staged + unstaged stats
+        let output = Command::new("git")
+            .args(["-C", &self.workdir.to_string_lossy(), "diff", "--numstat", "HEAD"])
+            .output();
+
+        let Ok(output) = output else {
+            return (0, 0);
+        };
+
+        if !output.status.success() {
+            return (0, 0);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut additions = 0;
+        let mut deletions = 0;
+
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                additions += parts[0].parse::<usize>().unwrap_or(0);
+                deletions += parts[1].parse::<usize>().unwrap_or(0);
+            }
+        }
+
+        (additions, deletions)
+    }
+
+    fn is_ignored_cli(&self, path: &Path) -> bool {
         let relative = path.strip_prefix(&self.workdir).unwrap_or(path);
-        repo.status_should_ignore(relative).unwrap_or(false)
+        Command::new("git")
+            .args(["-C", &self.workdir.to_string_lossy(), "check-ignore", "-q", &relative.to_string_lossy()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn get_file_diff_stats_cli(&self, path: &Path) -> (usize, usize) {
+        let relative = path.strip_prefix(&self.workdir).unwrap_or(path);
+        let output = Command::new("git")
+            .args(["-C", &self.workdir.to_string_lossy(), "diff", "--numstat", "HEAD", "--", &relative.to_string_lossy()])
+            .output();
+
+        let Ok(output) = output else {
+            return (0, 0);
+        };
+
+        if !output.status.success() {
+            return (0, 0);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let add = parts[0].parse::<usize>().unwrap_or(0);
+                let del = parts[1].parse::<usize>().unwrap_or(0);
+                return (add, del);
+            }
+        }
+
+        (0, 0)
+    }
+
+    fn is_ignored(&self, path: &Path) -> bool {
+        if let Some(repo) = &self.repo {
+            let relative = path.strip_prefix(&self.workdir).unwrap_or(path);
+            repo.status_should_ignore(relative).unwrap_or(false)
+        } else if self.use_git_cli {
+            self.is_ignored_cli(path)
+        } else {
+            false
+        }
     }
 
     fn get_ignored_root(&self, path: &Path) -> Option<String> {
@@ -167,13 +351,19 @@ impl WatState {
             }
 
             // Update file stats
-            if let Some(repo) = &self.repo {
-                if let Ok(diff_stats) = self.get_file_diff_stats(repo, &path) {
-                    let stats = self.file_stats.entry(path.clone()).or_default();
-                    stats.additions = diff_stats.0;
-                    stats.deletions = diff_stats.1;
-                    stats.last_modified = Some(now);
-                }
+            let diff_stats = if let Some(repo) = &self.repo {
+                self.get_file_diff_stats(repo, &path).ok()
+            } else if self.use_git_cli {
+                Some(self.get_file_diff_stats_cli(&path))
+            } else {
+                None
+            };
+
+            if let Some((additions, deletions)) = diff_stats {
+                let stats = self.file_stats.entry(path.clone()).or_default();
+                stats.additions = additions;
+                stats.deletions = deletions;
+                stats.last_modified = Some(now);
             }
 
             self.recent_changes.push(FileChange {
@@ -210,6 +400,10 @@ impl WatState {
     }
 
     fn get_git_status(&self) -> (i32, i32, i32, usize, usize) {
+        if self.use_git_cli {
+            return self.get_git_status_cli();
+        }
+
         let Some(repo) = &self.repo else {
             return (0, 0, 0, 0, 0);
         };
@@ -282,6 +476,19 @@ impl WatState {
     }
 
     fn update_last_commit(&mut self) {
+        if self.use_git_cli {
+            if let Some(new_commit) = Self::get_last_commit_cli(&self.workdir) {
+                // Only update if this is a new commit
+                if let Some((existing_hash, _, _, _)) = &self.last_commit {
+                    if *existing_hash == new_commit.0 {
+                        return;
+                    }
+                }
+                self.last_commit = Some(new_commit);
+            }
+            return;
+        }
+
         let Some(repo) = &self.repo else {
             return;
         };
@@ -457,7 +664,7 @@ fn render(state: &mut WatState) -> Result<()> {
 
     let mut git_line = format!("{BOLD}GIT{RESET}  ");
 
-    if state.repo.is_none() {
+    if state.repo.is_none() && !state.use_git_cli {
         git_line.push_str(&format!("{DIM}not a repo{RESET}"));
     } else if dirty == 0 && staged == 0 && untracked == 0 {
         git_line.push_str(&format!("{GREEN}ok{RESET} {DIM}clean{RESET}"));
