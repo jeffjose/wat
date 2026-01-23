@@ -604,7 +604,7 @@ fn should_skip_directory(name: &str) -> bool {
     })
 }
 
-fn setup_watcher(path: &Path) -> Result<(RecommendedWatcher, Receiver<notify::Result<NotifyEvent>>)> {
+fn setup_watcher(path: &Path, state: &WatState) -> Result<(RecommendedWatcher, Receiver<notify::Result<NotifyEvent>>)> {
     let (tx, rx) = channel();
 
     let mut watcher = RecommendedWatcher::new(
@@ -618,13 +618,21 @@ fn setup_watcher(path: &Path) -> Result<(RecommendedWatcher, Receiver<notify::Re
     watcher.watch(path, RecursiveMode::NonRecursive)?;
 
     // Walk the directory tree and selectively add watches
-    add_watches_recursive(&mut watcher, path, path)?;
+    add_watches_recursive(&mut watcher, path, path, 0, state)?;
 
     Ok((watcher, rx))
 }
 
+/// Maximum depth for recursive directory watching (prevents hanging on huge trees)
+const MAX_WATCH_DEPTH: usize = 10;
+
 /// Recursively add watches to directories, skipping heavy/ignored ones
-fn add_watches_recursive(watcher: &mut RecommendedWatcher, root: &Path, current: &Path) -> Result<()> {
+fn add_watches_recursive(watcher: &mut RecommendedWatcher, root: &Path, current: &Path, depth: usize, state: &WatState) -> Result<()> {
+    // Safety limit on recursion depth
+    if depth > MAX_WATCH_DEPTH {
+        return Ok(());
+    }
+
     let entries = match std::fs::read_dir(current) {
         Ok(entries) => entries,
         Err(_) => return Ok(()), // Skip directories we can't read
@@ -652,6 +660,22 @@ fn add_watches_recursive(watcher: &mut RecommendedWatcher, root: &Path, current:
             continue;
         }
 
+        // Skip directories that are repo-managed (contain .repo) - these are massive multi-project trees
+        if path.join(".repo").is_dir() {
+            continue;
+        }
+
+        // Skip directories that are themselves git repositories (nested repos)
+        // These are typically submodules or separate projects we shouldn't watch
+        if path.join(".git").exists() {
+            continue;
+        }
+
+        // Check if this directory is gitignored (using the actual git repo)
+        if state.is_ignored(&path) {
+            continue;
+        }
+
         // Check if this is a gitignored directory by checking for common ignore patterns
         // We do a quick check here - the full gitignore check happens in process_event
         let relative = path.strip_prefix(root).unwrap_or(&path);
@@ -662,7 +686,7 @@ fn add_watches_recursive(watcher: &mut RecommendedWatcher, root: &Path, current:
         // Add watch for this directory
         if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
             // Recurse into subdirectories
-            add_watches_recursive(watcher, root, &path)?;
+            add_watches_recursive(watcher, root, &path, depth + 1, state)?;
         }
     }
 
@@ -1000,8 +1024,8 @@ fn main() -> Result<()> {
 }
 
 fn run(path: &Path, interval: u64) -> Result<()> {
-    let (_watcher, rx) = setup_watcher(path)?;
     let mut state = WatState::new(path);
+    let (_watcher, rx) = setup_watcher(path, &state)?;
 
     loop {
         // Process file events
