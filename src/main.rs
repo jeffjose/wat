@@ -545,6 +545,65 @@ impl WatState {
     }
 }
 
+/// Directories that should never be watched (typically huge build output directories)
+const SKIP_WATCH_DIRS: &[&str] = &[
+    // Android
+    "out",
+    ".repo",
+    // Rust
+    "target",
+    // JavaScript/Node
+    "node_modules",
+    "dist",
+    ".next",
+    ".nuxt",
+    // Python
+    "__pycache__",
+    ".venv",
+    "venv",
+    "site-packages",
+    ".tox",
+    ".nox",
+    ".eggs",
+    "*.egg-info",
+    // Java/Gradle/Maven
+    ".gradle",
+    "build",
+    ".m2",
+    // Go
+    "vendor",
+    // Elixir
+    "_build",
+    "deps",
+    // Zig
+    "zig-cache",
+    "zig-out",
+    // Dart/Flutter
+    ".dart_tool",
+    // Swift/iOS
+    "Pods",
+    "DerivedData",
+    // C/C++
+    "cmake-build-debug",
+    "cmake-build-release",
+    // Generic
+    ".cache",
+    ".tmp",
+    "tmp",
+    "temp",
+];
+
+fn should_skip_directory(name: &str) -> bool {
+    SKIP_WATCH_DIRS.iter().any(|skip| {
+        if skip.starts_with("*.") {
+            // Glob pattern like "*.egg-info"
+            name.ends_with(&skip[1..])
+        } else {
+            name == *skip
+        }
+    })
+}
+
 fn setup_watcher(path: &Path) -> Result<(RecommendedWatcher, Receiver<notify::Result<NotifyEvent>>)> {
     let (tx, rx) = channel();
 
@@ -555,9 +614,72 @@ fn setup_watcher(path: &Path) -> Result<(RecommendedWatcher, Receiver<notify::Re
         Config::default().with_poll_interval(Duration::from_millis(100)),
     )?;
 
-    watcher.watch(path, RecursiveMode::Recursive)?;
+    // Watch the root directory first (non-recursive)
+    watcher.watch(path, RecursiveMode::NonRecursive)?;
+
+    // Walk the directory tree and selectively add watches
+    add_watches_recursive(&mut watcher, path, path)?;
 
     Ok((watcher, rx))
+}
+
+/// Recursively add watches to directories, skipping heavy/ignored ones
+fn add_watches_recursive(watcher: &mut RecommendedWatcher, root: &Path, current: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()), // Skip directories we can't read
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = match path.file_name() {
+            Some(name) => name.to_string_lossy(),
+            None => continue,
+        };
+
+        // Skip hidden directories (like .git)
+        if dir_name.starts_with('.') && dir_name != "." && dir_name != ".." {
+            continue;
+        }
+
+        // Skip known heavy directories
+        if should_skip_directory(&dir_name) {
+            continue;
+        }
+
+        // Check if this is a gitignored directory by checking for common ignore patterns
+        // We do a quick check here - the full gitignore check happens in process_event
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if is_likely_ignored(relative) {
+            continue;
+        }
+
+        // Add watch for this directory
+        if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+            // Recurse into subdirectories
+            add_watches_recursive(watcher, root, &path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Quick check if a path is likely gitignored (without needing git repo access)
+fn is_likely_ignored(path: &Path) -> bool {
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name_str = name.to_string_lossy();
+            if should_skip_directory(&name_str) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn format_relative_time(secs: u64) -> (String, &'static str) {
