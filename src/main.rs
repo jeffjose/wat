@@ -14,6 +14,7 @@ use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // ANSI color codes
@@ -26,8 +27,28 @@ const YELLOW: &str = "\x1b[33m";
 const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
 
+/// The version and the commit it was built from: `0.1.0-abc1234`, with
+/// `-dirty` if the tree had changes not committed.
+fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        // Unset where git could not be asked, or vergen's stand-in.
+        let Some(sha) =
+            option_env!("VERGEN_GIT_SHA").filter(|sha| !sha.is_empty() && !sha.contains("VERGEN"))
+        else {
+            return env!("CARGO_PKG_VERSION").to_string();
+        };
+        let dirty = if option_env!("VERGEN_GIT_DIRTY") == Some("true") {
+            "-dirty"
+        } else {
+            ""
+        };
+        format!("{}-{sha}{dirty}", env!("CARGO_PKG_VERSION"))
+    })
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "wat")]
+#[command(name = "wat", version = version())]
 #[command(about = "Watch what LLM agents are doing to your files", long_about = None)]
 struct Args {
     /// Path to watch (defaults to current directory)

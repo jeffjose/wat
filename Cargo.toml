@@ -10,3 +10,6 @@ crossterm = "0.27"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 chrono = "0.4"
+
+[build-dependencies]
+vergen-gitcl = "10.0.3"
